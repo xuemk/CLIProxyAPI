@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -71,6 +72,16 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+
+	persistentPriorityOriginalKey = "_cpa_original_priority"
+	persistentPriorityPenaltyKey  = "_cpa_priority_penalty"
+	persistentPriorityPenaltyMax  = 1000
+
+	codexQuotaUsageURL                   = "https://chatgpt.com/backend-api/wham/usage"
+	codexQuotaUserAgent                  = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	codexQuotaPriorityExhaustedPriority  = -9999
+	codexQuotaPriorityLoopMinInterval    = 3 * time.Minute
+	codexQuotaPriorityLoopIntervalJitter = 2 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -148,6 +159,8 @@ type Manager struct {
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
+	// lastSelected tracks the most recent credential that entered execution.
+	lastSelected map[string]SelectedAuthSnapshot
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -174,8 +187,9 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel context.CancelFunc
-	refreshLoop   *authAutoRefreshLoop
+	refreshCancel           context.CancelFunc
+	refreshLoop             *authAutoRefreshLoop
+	quotaPriorityLoopCancel context.CancelFunc
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -192,6 +206,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		lastSelected:     make(map[string]SelectedAuthSnapshot),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 	}
@@ -200,6 +215,59 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+// SelectedAuthSnapshot describes the most recent credential selected for execution.
+type SelectedAuthSnapshot struct {
+	AuthID     string
+	Provider   string
+	SelectedAt time.Time
+}
+
+// LastSelectedAuth returns the most recent selected credential for a provider.
+// An empty provider returns the newest credential across all providers.
+func (m *Manager) LastSelectedAuth(provider string) (SelectedAuthSnapshot, bool) {
+	if m == nil {
+		return SelectedAuthSnapshot{}, false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if provider != "" {
+		snapshot, ok := m.lastSelected[provider]
+		return snapshot, ok && strings.TrimSpace(snapshot.AuthID) != ""
+	}
+	var newest SelectedAuthSnapshot
+	for _, snapshot := range m.lastSelected {
+		if strings.TrimSpace(snapshot.AuthID) == "" {
+			continue
+		}
+		if newest.AuthID == "" || snapshot.SelectedAt.After(newest.SelectedAt) {
+			newest = snapshot
+		}
+	}
+	return newest, newest.AuthID != ""
+}
+
+func (m *Manager) recordSelectedAuth(provider, authID string) {
+	if m == nil {
+		return
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	authID = strings.TrimSpace(authID)
+	if provider == "" || authID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastSelected == nil {
+		m.lastSelected = make(map[string]SelectedAuthSnapshot)
+	}
+	m.lastSelected[provider] = SelectedAuthSnapshot{
+		AuthID:     authID,
+		Provider:   provider,
+		SelectedAt: time.Now(),
+	}
 }
 
 func isBuiltInSelector(selector Selector) bool {
@@ -1321,6 +1389,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if len(models) == 0 {
 			continue
 		}
+		m.recordSelectedAuth(provider, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
@@ -1399,6 +1468,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if len(models) == 0 {
 			continue
 		}
+		m.recordSelectedAuth(provider, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
@@ -1476,6 +1546,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if len(models) == 0 {
 			continue
 		}
+		m.recordSelectedAuth(provider, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
 		if errStream != nil {
@@ -1572,13 +1643,34 @@ func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 }
 
 func isFreeCodexAuth(auth *Auth) bool {
-	if auth == nil || auth.Attributes == nil {
+	if auth == nil {
 		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+	return codexPlanType(auth) == "free"
+}
+
+func codexPlanType(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		for _, key := range []string{"plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType"} {
+			if value := strings.ToLower(strings.TrimSpace(auth.Attributes[key])); value != "" {
+				return value
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType"} {
+			if value := strings.ToLower(strings.TrimSpace(stringFromAny(auth.Metadata[key]))); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func publishSelectedAuthMetadata(meta map[string]any, authID string) {
@@ -2129,6 +2221,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					auth.Status = StatusError
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
+					applyPersistentPriorityPenalty(auth, statusCode)
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
@@ -2544,6 +2637,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+	applyPersistentPriorityPenalty(auth, statusCode)
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
@@ -2562,6 +2656,101 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
+}
+
+func shouldApplyPersistentPriorityPenalty(statusCode int) bool {
+	switch statusCode {
+	case 402, 403, 404, 429:
+		return true
+	default:
+		return false
+	}
+}
+
+func applyPersistentPriorityPenalty(auth *Auth, statusCode int) {
+	if auth == nil || !shouldApplyPersistentPriorityPenalty(statusCode) {
+		return
+	}
+	if auth.Metadata == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+
+	basePriority := persistentPriorityBase(auth)
+	penalty := persistentPriorityPenalty(auth)
+	if penalty < persistentPriorityPenaltyMax {
+		penalty++
+	}
+	targetPriority := basePriority - penalty
+	currentPriority := authPriority(auth)
+	if currentPriority <= targetPriority && persistentPriorityPenalty(auth) == penalty {
+		return
+	}
+
+	auth.Metadata[persistentPriorityOriginalKey] = basePriority
+	auth.Metadata[persistentPriorityPenaltyKey] = penalty
+	auth.Metadata["priority"] = targetPriority
+	auth.Attributes["priority"] = strconv.Itoa(targetPriority)
+}
+
+func persistentPriorityBase(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if auth.Metadata != nil {
+		if base, ok := anyInt(auth.Metadata[persistentPriorityOriginalKey]); ok {
+			return base
+		}
+		if base, ok := anyInt(auth.Metadata["priority"]); ok {
+			return base
+		}
+	}
+	return authPriority(auth)
+}
+
+func persistentPriorityPenalty(auth *Auth) int {
+	if auth == nil || auth.Metadata == nil {
+		return 0
+	}
+	if penalty, ok := anyInt(auth.Metadata[persistentPriorityPenaltyKey]); ok {
+		if penalty < 0 {
+			return 0
+		}
+		if penalty > persistentPriorityPenaltyMax {
+			return persistentPriorityPenaltyMax
+		}
+		return penalty
+	}
+	return 0
+}
+
+func anyInt(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int8:
+		return int(v), true
+	case int16:
+		return int(v), true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 // List returns all auth entries currently known by the manager.
@@ -3092,6 +3281,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		if len(models) == 0 {
 			continue
 		}
+		m.recordSelectedAuth(c.provider, c.auth.ID)
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, len(models) > 1)
 			execReq := req
@@ -3134,6 +3324,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
+		m.recordSelectedAuth(c.provider, c.auth.ID)
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
 		if errStream != nil {
 			continue
@@ -3161,6 +3352,432 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	}
 	_, err := m.store.Save(ctx, auth)
 	return err
+}
+
+func (m *Manager) startCodexQuotaPriorityLoop(parent context.Context) {
+	if m == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+
+	m.mu.Lock()
+	cancelPrev := m.quotaPriorityLoopCancel
+	m.quotaPriorityLoopCancel = cancel
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
+	}
+
+	go m.runCodexQuotaPriorityLoop(ctx)
+}
+
+func (m *Manager) stopCodexQuotaPriorityLoop() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	cancel := m.quotaPriorityLoopCancel
+	m.quotaPriorityLoopCancel = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) runCodexQuotaPriorityLoop(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.refreshCodexQuotaPriorities(ctx)
+	for {
+		timer := time.NewTimer(codexQuotaPriorityNextInterval())
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+			m.refreshCodexQuotaPriorities(ctx)
+		}
+	}
+}
+
+func codexQuotaPriorityNextInterval() time.Duration {
+	if codexQuotaPriorityLoopIntervalJitter <= 0 {
+		return codexQuotaPriorityLoopMinInterval
+	}
+	jitter := time.Duration(time.Now().UnixNano() % int64(codexQuotaPriorityLoopIntervalJitter))
+	if jitter < 0 {
+		jitter = -jitter
+	}
+	return codexQuotaPriorityLoopMinInterval + jitter
+}
+
+func (m *Manager) refreshCodexQuotaPriorities(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	for _, auth := range m.codexQuotaPriorityCandidates() {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if err := m.refreshCodexQuotaPriority(ctx, auth); err != nil {
+			log.Debugf("codex quota priority refresh failed for %s: %v", auth.ID, err)
+		}
+	}
+}
+
+func (m *Manager) codexQuotaPriorityCandidates() []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Auth, 0)
+	for _, auth := range m.auths {
+		if shouldPollCodexQuotaPriority(auth) {
+			out = append(out, auth.Clone())
+		}
+	}
+	return out
+}
+
+func shouldPollCodexQuotaPriority(auth *Auth) bool {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	plan := codexPlanType(auth)
+	if plan == "" || plan == "free" {
+		return false
+	}
+	return codexQuotaAccountID(auth) != ""
+}
+
+func (m *Manager) refreshCodexQuotaPriority(ctx context.Context, auth *Auth) error {
+	if m == nil || auth == nil {
+		return nil
+	}
+	remaining, ok, statusCode, err := m.fetchCodexQuotaFiveHourRemaining(ctx, auth)
+	if statusCode == http.StatusUnauthorized {
+		m.refreshAuth(ctx, auth.ID)
+		if updated, exists := m.GetByID(auth.ID); exists && updated != nil {
+			remaining, ok, _, err = m.fetchCodexQuotaFiveHourRemaining(ctx, updated)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	m.applyCodexQuotaPriority(ctx, auth.ID, remaining > 0)
+	return nil
+}
+
+func (m *Manager) fetchCodexQuotaFiveHourRemaining(ctx context.Context, auth *Auth) (float64, bool, int, error) {
+	if m == nil || auth == nil {
+		return 0, false, 0, nil
+	}
+	accountID := codexQuotaAccountID(auth)
+	if accountID == "" {
+		return 0, false, 0, nil
+	}
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, codexQuotaUsageURL, nil)
+	if errReq != nil {
+		return 0, false, 0, errReq
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", codexQuotaUserAgent)
+	req.Header.Set("Chatgpt-Account-Id", accountID)
+
+	resp, errDo := m.HttpRequest(ctx, auth, req)
+	if errDo != nil {
+		return 0, false, 0, errDo
+	}
+	if resp == nil {
+		return 0, false, 0, errors.New("codex quota priority refresh returned nil response")
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("codex quota priority response body close error: %v", errClose)
+		}
+	}()
+
+	body, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		return 0, false, resp.StatusCode, errRead
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, false, resp.StatusCode, errors.New("codex quota priority refresh returned non-2xx status")
+	}
+	remaining, ok := parseCodexQuotaFiveHourRemaining(body)
+	return remaining, ok, resp.StatusCode, nil
+}
+
+func (m *Manager) applyCodexQuotaPriority(ctx context.Context, authID string, fiveHourAvailable bool) {
+	if m == nil || authID == "" {
+		return
+	}
+	var snapshot *Auth
+	m.mu.Lock()
+	auth := m.auths[authID]
+	if auth != nil && shouldPollCodexQuotaPriority(auth) {
+		if applyCodexQuotaPriorityState(auth, fiveHourAvailable) {
+			auth.UpdatedAt = time.Now()
+			if errPersist := m.persist(ctx, auth); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist codex quota priority state: %v", errPersist)
+			}
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+	if snapshot == nil {
+		return
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
+}
+
+func applyCodexQuotaPriorityState(auth *Auth, fiveHourAvailable bool) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+
+	basePriority := persistentPriorityBase(auth)
+	if fiveHourAvailable {
+		changed := setAuthPriority(auth, basePriority)
+		if _, exists := auth.Metadata[persistentPriorityPenaltyKey]; exists {
+			delete(auth.Metadata, persistentPriorityPenaltyKey)
+			changed = true
+		}
+		return changed
+	}
+
+	changed := false
+	if _, exists := auth.Metadata[persistentPriorityOriginalKey]; !exists {
+		auth.Metadata[persistentPriorityOriginalKey] = basePriority
+		changed = true
+	}
+	penalty := basePriority - codexQuotaPriorityExhaustedPriority
+	if penalty < 0 {
+		penalty = 0
+	}
+	if currentPenalty, ok := anyInt(auth.Metadata[persistentPriorityPenaltyKey]); !ok || currentPenalty != penalty {
+		auth.Metadata[persistentPriorityPenaltyKey] = penalty
+		changed = true
+	}
+	return setAuthPriority(auth, codexQuotaPriorityExhaustedPriority) || changed
+}
+
+func setAuthPriority(auth *Auth, priority int) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	changed := false
+	if current, ok := anyInt(auth.Metadata["priority"]); !ok || current != priority {
+		auth.Metadata["priority"] = priority
+		changed = true
+	}
+	priorityText := strconv.Itoa(priority)
+	if strings.TrimSpace(auth.Attributes["priority"]) != priorityText {
+		auth.Attributes["priority"] = priorityText
+		changed = true
+	}
+	return changed
+}
+
+func codexQuotaAccountID(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"} {
+			if value := strings.TrimSpace(stringFromAny(auth.Metadata[key])); value != "" {
+				return value
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		for _, key := range []string{"account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"} {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func parseCodexQuotaFiveHourRemaining(body []byte) (float64, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, false
+	}
+	limit := mapFromAny(firstMapValue(payload, "rate_limit", "rateLimit"))
+	if limit == nil {
+		return 0, false
+	}
+	window := codexQuotaFiveHourWindow(limit)
+	if window == nil {
+		return 0, false
+	}
+	usedPercent, ok := floatFromAny(firstMapValue(window, "used_percent", "usedPercent"))
+	if !ok {
+		reached, reachedOK := boolFromAny(firstMapValue(limit, "limit_reached", "limitReached"))
+		allowed, allowedOK := boolFromAny(firstMapValue(limit, "allowed"))
+		if (reachedOK && reached) || (allowedOK && !allowed) {
+			usedPercent = 100
+			ok = true
+		}
+	}
+	if !ok {
+		return 0, false
+	}
+	return clampPercent(100 - usedPercent), true
+}
+
+func codexQuotaFiveHourWindow(limit map[string]any) map[string]any {
+	if limit == nil {
+		return nil
+	}
+	primary := mapFromAny(firstMapValue(limit, "primary_window", "primaryWindow"))
+	secondary := mapFromAny(firstMapValue(limit, "secondary_window", "secondaryWindow"))
+	for _, window := range []map[string]any{primary, secondary} {
+		if window == nil {
+			continue
+		}
+		seconds, ok := floatFromAny(firstMapValue(window, "limit_window_seconds", "limitWindowSeconds"))
+		if ok && int64(seconds) == 18000 {
+			return window
+		}
+	}
+	if primary != nil {
+		return primary
+	}
+	return nil
+}
+
+func firstMapValue(values map[string]any, keys ...string) any {
+	if values == nil {
+		return nil
+	}
+	for _, key := range keys {
+		if value, ok := values[key]; ok && value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func mapFromAny(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	if out, ok := value.(map[string]any); ok {
+		return out
+	}
+	return nil
+}
+
+func floatFromAny(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint8:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case json.Number:
+		if parsed, err := v.Float64(); err == nil {
+			return parsed, true
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, false
+		}
+		s = strings.TrimSuffix(s, "%")
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+	return 0, false
+}
+
+func boolFromAny(value any) (bool, bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		return parsed, err == nil
+	default:
+		return false, false
+	}
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case json.Number:
+		return v.String()
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return ""
+	}
+}
+
+func clampPercent(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
 }
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness
@@ -3194,11 +3811,13 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
+	m.startCodexQuotaPriorityLoop(parent)
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
 // It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
+	m.stopCodexQuotaPriorityLoop()
 	m.mu.Lock()
 	cancel := m.refreshCancel
 	m.refreshCancel = nil

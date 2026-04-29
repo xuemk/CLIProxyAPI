@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -34,8 +35,12 @@ type authTabModel struct {
 	ready    bool
 	cursor   int
 	expanded int // -1 = none expanded, >=0 = expanded index
-	confirm  int // -1 = no confirmation, >=0 = confirm delete for index
 	status   string
+	selected map[string]struct{}
+
+	showUnauthorizedOnly bool
+	confirmNames         []string
+	confirmLabel         string
 
 	// Editing state
 	editing      bool            // true when editing a field
@@ -60,8 +65,8 @@ func newAuthTabModel(client *Client) authTabModel {
 	return authTabModel{
 		client:    client,
 		expanded:  -1,
-		confirm:   -1,
 		editInput: ti,
+		selected:  make(map[string]struct{}),
 	}
 }
 
@@ -85,9 +90,8 @@ func (m authTabModel) Update(msg tea.Msg) (authTabModel, tea.Cmd) {
 		} else {
 			m.err = nil
 			m.files = msg.files
-			if m.cursor >= len(m.files) {
-				m.cursor = max(0, len(m.files)-1)
-			}
+			m.pruneSelection()
+			m.clampCursor()
 			m.status = ""
 		}
 		m.viewport.SetContent(m.renderContent())
@@ -99,7 +103,9 @@ func (m authTabModel) Update(msg tea.Msg) (authTabModel, tea.Cmd) {
 		} else {
 			m.status = successStyle.Render("✓ " + msg.action)
 		}
-		m.confirm = -1
+		m.confirmNames = nil
+		m.confirmLabel = ""
+		m.clampCursor()
 		m.viewport.SetContent(m.renderContent())
 		return m, m.fetchFiles
 
@@ -110,7 +116,7 @@ func (m authTabModel) Update(msg tea.Msg) (authTabModel, tea.Cmd) {
 		}
 
 		// ---- Delete confirmation mode ----
-		if m.confirm >= 0 {
+		if len(m.confirmNames) > 0 {
 			return m.handleConfirmInput(msg)
 		}
 
@@ -125,17 +131,17 @@ func (m authTabModel) Update(msg tea.Msg) (authTabModel, tea.Cmd) {
 
 // startEdit activates inline editing for a field on the currently selected auth file.
 func (m *authTabModel) startEdit(fieldIdx int) tea.Cmd {
-	if m.cursor >= len(m.files) {
+	current, ok := m.currentVisibleFile()
+	if !ok {
 		return nil
 	}
-	f := m.files[m.cursor]
-	m.editFileName = getString(f, "name")
+	m.editFileName = getString(current, "name")
 	m.editField = fieldIdx
 	m.editing = true
 
 	// Pre-populate with current value
 	key := authEditableFields[fieldIdx].key
-	currentVal := getAnyString(f, key)
+	currentVal := getAnyString(current, key)
 	m.editInput.SetValue(currentVal)
 	m.editInput.Focus()
 	m.editInput.Prompt = fmt.Sprintf("  %s: ", authEditableFields[fieldIdx].label)
@@ -173,6 +179,14 @@ func (m authTabModel) renderContent() string {
 	sb.WriteString("\n")
 	sb.WriteString(helpStyle.Render(T("auth_help2")))
 	sb.WriteString("\n")
+	if m.showUnauthorizedOnly || len(m.selected) > 0 {
+		filterLabel := T("auth_filter_all")
+		if m.showUnauthorizedOnly {
+			filterLabel = T("auth_filter_unauthorized")
+		}
+		sb.WriteString(helpStyle.Render(fmt.Sprintf(T("auth_state"), filterLabel, len(m.selected))))
+		sb.WriteString("\n")
+	}
 	sb.WriteString(strings.Repeat("─", m.width))
 	sb.WriteString("\n")
 
@@ -182,13 +196,19 @@ func (m authTabModel) renderContent() string {
 		return sb.String()
 	}
 
-	if len(m.files) == 0 {
+	visible := m.visibleFiles()
+	if len(visible) == 0 {
+		if len(m.files) > 0 && m.showUnauthorizedOnly {
+			sb.WriteString(subtitleStyle.Render(T("no_auth_matches")))
+			sb.WriteString("\n")
+			return sb.String()
+		}
 		sb.WriteString(subtitleStyle.Render(T("no_auth_files")))
 		sb.WriteString("\n")
 		return sb.String()
 	}
 
-	for i, f := range m.files {
+	for i, f := range visible {
 		name := getString(f, "name")
 		channel := getString(f, "channel")
 		email := getString(f, "email")
@@ -207,6 +227,10 @@ func (m authTabModel) renderContent() string {
 			cursor = "▸ "
 			rowStyle = lipgloss.NewStyle().Bold(true)
 		}
+		selectedMarker := "[ ]"
+		if _, ok := m.selected[name]; ok {
+			selectedMarker = "[x]"
+		}
 
 		displayName := name
 		if len(displayName) > 24 {
@@ -217,14 +241,14 @@ func (m authTabModel) renderContent() string {
 			displayEmail = displayEmail[:25] + "..."
 		}
 
-		row := fmt.Sprintf("%s%s %-24s %-12s %-28s %s",
-			cursor, statusIcon, displayName, channel, displayEmail, statusText)
+		row := fmt.Sprintf("%s%s %s %-24s %-12s %-28s %s",
+			cursor, selectedMarker, statusIcon, displayName, channel, displayEmail, statusText)
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
 		// Delete confirmation
-		if m.confirm == i {
-			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete"), name)))
+		if len(m.confirmNames) > 0 && m.confirmIncludes(name) {
+			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete"), m.confirmLabel)))
 			sb.WriteString("\n")
 		}
 
@@ -327,6 +351,117 @@ func max(a, b int) int {
 	return b
 }
 
+func (m authTabModel) visibleFiles() []map[string]any {
+	if !m.showUnauthorizedOnly {
+		return m.files
+	}
+	filtered := make([]map[string]any, 0, len(m.files))
+	for _, f := range m.files {
+		if isUnauthorizedAuthFile(f) {
+			filtered = append(filtered, f)
+		}
+	}
+	return filtered
+}
+
+func (m *authTabModel) clampCursor() {
+	visible := m.visibleFiles()
+	if len(visible) == 0 {
+		m.cursor = 0
+		m.expanded = -1
+		return
+	}
+	if m.cursor >= len(visible) {
+		m.cursor = len(visible) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.expanded >= len(visible) {
+		m.expanded = -1
+	}
+}
+
+func (m *authTabModel) pruneSelection() {
+	if m.selected == nil {
+		m.selected = make(map[string]struct{})
+	}
+	valid := make(map[string]struct{}, len(m.files))
+	for _, f := range m.files {
+		valid[getString(f, "name")] = struct{}{}
+	}
+	for name := range m.selected {
+		if _, ok := valid[name]; !ok {
+			delete(m.selected, name)
+		}
+	}
+}
+
+func (m authTabModel) currentVisibleFile() (map[string]any, bool) {
+	visible := m.visibleFiles()
+	if len(visible) == 0 || m.cursor < 0 || m.cursor >= len(visible) {
+		return nil, false
+	}
+	return visible[m.cursor], true
+}
+
+func (m authTabModel) confirmIncludes(name string) bool {
+	for _, candidate := range m.confirmNames {
+		if candidate == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m authTabModel) selectedNames() []string {
+	names := make([]string, 0, len(m.selected))
+	for name := range m.selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (m *authTabModel) toggleCurrentSelection() {
+	current, ok := m.currentVisibleFile()
+	if !ok {
+		return
+	}
+	name := getString(current, "name")
+	if _, ok := m.selected[name]; ok {
+		delete(m.selected, name)
+		return
+	}
+	m.selected[name] = struct{}{}
+}
+
+func (m *authTabModel) toggleAllVisibleSelections() {
+	visible := m.visibleFiles()
+	if len(visible) == 0 {
+		return
+	}
+	allSelected := true
+	for _, f := range visible {
+		if _, ok := m.selected[getString(f, "name")]; !ok {
+			allSelected = false
+			break
+		}
+	}
+	for _, f := range visible {
+		name := getString(f, "name")
+		if allSelected {
+			delete(m.selected, name)
+			continue
+		}
+		m.selected[name] = struct{}{}
+	}
+}
+
+func isUnauthorizedAuthFile(f map[string]any) bool {
+	return strings.EqualFold(strings.TrimSpace(getAnyString(f, "status_message")), "unauthorized")
+}
+
 func (m authTabModel) handleEditInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
@@ -370,22 +505,33 @@ func (m authTabModel) handleEditInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 func (m authTabModel) handleConfirmInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
-		idx := m.confirm
-		m.confirm = -1
-		if idx < len(m.files) {
-			name := getString(m.files[idx], "name")
+		names := append([]string(nil), m.confirmNames...)
+		m.confirmNames = nil
+		m.confirmLabel = ""
+		if len(names) > 0 {
+			for _, name := range names {
+				delete(m.selected, name)
+			}
 			return m, func() tea.Msg {
-				err := m.client.DeleteAuthFile(name)
+				if len(names) == 1 {
+					err := m.client.DeleteAuthFile(names[0])
+					if err != nil {
+						return authActionMsg{err: err}
+					}
+					return authActionMsg{action: fmt.Sprintf(T("deleted"), names[0])}
+				}
+				err := m.client.DeleteAuthFiles(names)
 				if err != nil {
 					return authActionMsg{err: err}
 				}
-				return authActionMsg{action: fmt.Sprintf(T("deleted"), name)}
+				return authActionMsg{action: fmt.Sprintf(T("deleted_selected"), len(names))}
 			}
 		}
 		m.viewport.SetContent(m.renderContent())
 		return m, nil
 	case "n", "N", "esc":
-		m.confirm = -1
+		m.confirmNames = nil
+		m.confirmLabel = ""
 		m.viewport.SetContent(m.renderContent())
 		return m, nil
 	}
@@ -395,18 +541,24 @@ func (m authTabModel) handleConfirmInput(msg tea.KeyMsg) (authTabModel, tea.Cmd)
 func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 	switch msg.String() {
 	case "j", "down":
-		if len(m.files) > 0 {
-			m.cursor = (m.cursor + 1) % len(m.files)
+		visible := m.visibleFiles()
+		if len(visible) > 0 {
+			m.cursor = (m.cursor + 1) % len(visible)
 			m.viewport.SetContent(m.renderContent())
 		}
 		return m, nil
 	case "k", "up":
-		if len(m.files) > 0 {
-			m.cursor = (m.cursor - 1 + len(m.files)) % len(m.files)
+		visible := m.visibleFiles()
+		if len(visible) > 0 {
+			m.cursor = (m.cursor - 1 + len(visible)) % len(visible)
 			m.viewport.SetContent(m.renderContent())
 		}
 		return m, nil
 	case "enter", " ":
+		visible := m.visibleFiles()
+		if len(visible) == 0 {
+			return m, nil
+		}
 		if m.expanded == m.cursor {
 			m.expanded = -1
 		} else {
@@ -414,15 +566,40 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 		}
 		m.viewport.SetContent(m.renderContent())
 		return m, nil
-	case "d", "D":
-		if m.cursor < len(m.files) {
-			m.confirm = m.cursor
+	case "d":
+		if current, ok := m.currentVisibleFile(); ok {
+			name := getString(current, "name")
+			m.confirmNames = []string{name}
+			m.confirmLabel = name
 			m.viewport.SetContent(m.renderContent())
 		}
 		return m, nil
+	case "D":
+		names := m.selectedNames()
+		if len(names) > 0 {
+			m.confirmNames = names
+			m.confirmLabel = fmt.Sprintf(T("selected_auth_files"), len(names))
+			m.viewport.SetContent(m.renderContent())
+		}
+		return m, nil
+	case "x":
+		m.toggleCurrentSelection()
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	case "X":
+		m.toggleAllVisibleSelections()
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	case "u", "U":
+		m.showUnauthorizedOnly = !m.showUnauthorizedOnly
+		m.expanded = -1
+		m.confirmNames = nil
+		m.confirmLabel = ""
+		m.clampCursor()
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
 	case "e", "E":
-		if m.cursor < len(m.files) {
-			f := m.files[m.cursor]
+		if f, ok := m.currentVisibleFile(); ok {
 			name := getString(f, "name")
 			disabled := getBool(f, "disabled")
 			newDisabled := !disabled

@@ -245,13 +245,36 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
+	currentAuth, hasCurrentAuth := h.authManager.LastSelectedAuth("")
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			if hasCurrentAuth && auth.ID == currentAuth.AuthID {
+				entry["current"] = true
+				if currentAuth.Provider != "" {
+					entry["current_provider"] = currentAuth.Provider
+				}
+				if !currentAuth.SelectedAt.IsZero() {
+					entry["current_selected_at"] = currentAuth.SelectedAt
+				}
+			}
 			files = append(files, entry)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
+	fillFirst := false
+	if h.cfg != nil {
+		if strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy); ok && strategy == "fill-first" {
+			fillFirst = true
+		}
+	}
+	sort.SliceStable(files, func(i, j int) bool {
+		if fillFirst {
+			currentI, _ := files[i]["current"].(bool)
+			currentJ, _ := files[j]["current"].(bool)
+			if currentI != currentJ {
+				return currentI
+			}
+		}
 		nameI, _ := files[i]["name"].(string)
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
@@ -1280,9 +1303,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			if *req.Priority == 0 {
 				delete(targetAuth.Metadata, "priority")
 				delete(targetAuth.Attributes, "priority")
+				delete(targetAuth.Metadata, "_cpa_original_priority")
+				delete(targetAuth.Metadata, "_cpa_priority_penalty")
 			} else {
 				targetAuth.Metadata["priority"] = *req.Priority
 				targetAuth.Attributes["priority"] = strconv.Itoa(*req.Priority)
+				targetAuth.Metadata["_cpa_original_priority"] = *req.Priority
+				delete(targetAuth.Metadata, "_cpa_priority_penalty")
 			}
 		}
 		if req.Note != nil {

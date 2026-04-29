@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,6 +22,11 @@ import (
 )
 
 const defaultAPICallTimeout = 60 * time.Second
+
+const (
+	codexUsageURL       = "https://chatgpt.com/backend-api/wham/usage"
+	codexQuotaUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+)
 
 const (
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -214,6 +220,129 @@ func (h *Handler) APICall(c *gin.Context) {
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+// GetLocalCurrentCodexQuota returns the current Codex quota for localhost UI helpers.
+// It intentionally bypasses the management key but is restricted to loopback clients.
+func (h *Handler) GetLocalCurrentCodexQuota(c *gin.Context) {
+	if !isLoopbackClientIP(c.ClientIP()) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "localhost only"})
+		return
+	}
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	strategy := "round-robin"
+	if h.cfg != nil {
+		if normalized, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy); ok {
+			strategy = normalized
+		}
+	}
+	if strategy != "fill-first" {
+		c.JSON(http.StatusConflict, gin.H{"error": "fill-first mode is not enabled", "strategy": strategy})
+		return
+	}
+
+	currentAuth, ok := h.authManager.LastSelectedAuth("codex")
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "current Codex auth not selected yet", "strategy": strategy})
+		return
+	}
+	auth, ok := h.authManager.GetByID(currentAuth.AuthID)
+	if !ok || auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "current Codex auth not found", "strategy": strategy})
+		return
+	}
+
+	accountID := codexAccountID(auth)
+	if accountID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current Codex auth missing ChatGPT account ID", "strategy": strategy})
+		return
+	}
+
+	token, errToken := h.resolveTokenForAuth(c.Request.Context(), auth)
+	if errToken != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "auth token refresh failed", "strategy": strategy})
+		return
+	}
+	if strings.TrimSpace(token) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found", "strategy": strategy})
+		return
+	}
+
+	req, errRequest := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, codexUsageURL, nil)
+	if errRequest != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build quota request", "strategy": strategy})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", codexQuotaUserAgent)
+	req.Header.Set("Chatgpt-Account-Id", accountID)
+
+	httpClient := &http.Client{Timeout: defaultAPICallTimeout}
+	httpClient.Transport = h.apiCallTransport(auth)
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		log.WithError(errDo).Debug("local current Codex quota request failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed", "strategy": strategy})
+		return
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+	}()
+
+	respBody, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response", "strategy": strategy})
+		return
+	}
+
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		entry = gin.H{"id": auth.ID, "provider": auth.Provider, "type": auth.Provider}
+	}
+	entry["current"] = true
+	entry["current_provider"] = currentAuth.Provider
+	if !currentAuth.SelectedAt.IsZero() {
+		entry["current_selected_at"] = currentAuth.SelectedAt
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"strategy":    strategy,
+		"current":     entry,
+		"status_code": resp.StatusCode,
+		"header":      resp.Header,
+		"body":        string(respBody),
+	})
+}
+
+func isLoopbackClientIP(clientIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(clientIP))
+	return ip != nil && ip.IsLoopback()
+}
+
+func codexAccountID(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok {
+			if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	if claims := extractCodexIDTokenClaims(auth); claims != nil {
+		if accountID, ok := claims["chatgpt_account_id"].(string); ok {
+			return strings.TrimSpace(accountID)
+		}
+	}
+	return ""
 }
 
 func firstNonEmptyString(values ...*string) string {

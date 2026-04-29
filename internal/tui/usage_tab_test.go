@@ -132,3 +132,48 @@ func TestUsageTimeTranslations(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthTabVisibleFilesFiltersUnauthorized(t *testing.T) {
+	model := authTabModel{
+		files: []map[string]any{
+			{"name": "ok.json", "status_message": ""},
+			{"name": "unauth.json", "status_message": "unauthorized"},
+			{"name": "quota.json", "status_message": "quota exhausted"},
+		},
+		showUnauthorizedOnly: true,
+	}
+
+	visible := model.visibleFiles()
+	if len(visible) != 1 {
+		t.Fatalf("visibleFiles len = %d, want 1", len(visible))
+	}
+	if got := getAnyString(visible[0], "name"); got != "unauth.json" {
+		t.Fatalf("visibleFiles[0].name = %q, want %q", got, "unauth.json")
+	}
+}
+
+func TestAuthTabToggleAllVisibleSelectionsHonoursUnauthorizedFilter(t *testing.T) {
+	model := authTabModel{
+		files: []map[string]any{
+			{"name": "ok.json", "status_message": ""},
+			{"name": "unauth-a.json", "status_message": "unauthorized"},
+			{"name": "unauth-b.json", "status_message": "unauthorized"},
+		},
+		selected:             make(map[string]struct{}),
+		showUnauthorizedOnly: true,
+	}
+
+	model.toggleAllVisibleSelections()
+	selected := model.selectedNames()
+	if len(selected) != 2 {
+		t.Fatalf("selected len = %d, want 2", len(selected))
+	}
+	if selected[0] != "unauth-a.json" || selected[1] != "unauth-b.json" {
+		t.Fatalf("selected names = %#v, want unauthorized-only entries", selected)
+	}
+
+	model.toggleAllVisibleSelections()
+	if len(model.selectedNames()) != 0 {
+		t.Fatalf("expected selections to be cleared on second toggle")
+	}
+}

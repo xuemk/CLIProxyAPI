@@ -5,7 +5,10 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,9 +16,29 @@ import (
 
 	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 var statisticsEnabled atomic.Bool
+var statisticsPersistence statisticsPersistenceState
+
+const statisticsPersistenceFileName = "usage-statistics.json"
+const statisticsPersistenceDebounce = 2 * time.Second
+
+type statisticsPersistenceState struct {
+	mu       sync.Mutex
+	stats    *RequestStatistics
+	filePath string
+	signal   chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+}
+
+type statisticsPersistencePayload struct {
+	Version    int                `json:"version"`
+	ExportedAt time.Time          `json:"exported_at"`
+	Usage      StatisticsSnapshot `json:"usage"`
+}
 
 func init() {
 	statisticsEnabled.Store(true)
@@ -210,6 +233,8 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+
+	scheduleStatisticsPersistence()
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -352,7 +377,224 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 		}
 	}
 
+	scheduleStatisticsPersistence()
 	return result
+}
+
+// StartStatisticsPersistence restores usage statistics from disk and enables
+// debounced background persistence for subsequent updates.
+func StartStatisticsPersistence(configPath string, stats *RequestStatistics) error {
+	if stats == nil {
+		stats = defaultRequestStatistics
+	}
+
+	filePath, err := resolveStatisticsPersistencePath(configPath)
+	if err != nil {
+		return err
+	}
+
+	statisticsPersistence.mu.Lock()
+	if statisticsPersistence.done != nil &&
+		statisticsPersistence.filePath == filePath &&
+		statisticsPersistence.stats == stats {
+		statisticsPersistence.mu.Unlock()
+		return nil
+	}
+	stopPrev := statisticsPersistence.stop
+	donePrev := statisticsPersistence.done
+	statisticsPersistence.stop = nil
+	statisticsPersistence.done = nil
+	statisticsPersistence.signal = nil
+	statisticsPersistence.filePath = ""
+	statisticsPersistence.stats = nil
+	statisticsPersistence.mu.Unlock()
+
+	if stopPrev != nil && donePrev != nil {
+		close(stopPrev)
+		<-donePrev
+	}
+
+	if errLoad := loadStatisticsSnapshotFromFile(stats, filePath); errLoad != nil {
+		return errLoad
+	}
+
+	signal := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	statisticsPersistence.mu.Lock()
+	statisticsPersistence.stats = stats
+	statisticsPersistence.filePath = filePath
+	statisticsPersistence.signal = signal
+	statisticsPersistence.stop = stop
+	statisticsPersistence.done = done
+	statisticsPersistence.mu.Unlock()
+
+	go runStatisticsPersistenceLoop(stats, filePath, signal, stop, done)
+	return nil
+}
+
+// ShutdownStatisticsPersistence flushes the current statistics snapshot and
+// stops the background persistence worker.
+func ShutdownStatisticsPersistence() error {
+	statisticsPersistence.mu.Lock()
+	stop := statisticsPersistence.stop
+	done := statisticsPersistence.done
+	statisticsPersistence.stop = nil
+	statisticsPersistence.done = nil
+	statisticsPersistence.signal = nil
+	statisticsPersistence.filePath = ""
+	statisticsPersistence.stats = nil
+	statisticsPersistence.mu.Unlock()
+
+	if stop == nil || done == nil {
+		return nil
+	}
+
+	close(stop)
+	<-done
+	return nil
+}
+
+func scheduleStatisticsPersistence() {
+	statisticsPersistence.mu.Lock()
+	signal := statisticsPersistence.signal
+	statisticsPersistence.mu.Unlock()
+	if signal == nil {
+		return
+	}
+	select {
+	case signal <- struct{}{}:
+	default:
+	}
+}
+
+func runStatisticsPersistenceLoop(stats *RequestStatistics, filePath string, signal <-chan struct{}, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+
+	var timer *time.Timer
+	var timerCh <-chan time.Time
+
+	for {
+		select {
+		case <-signal:
+			if timer == nil {
+				timer = time.NewTimer(statisticsPersistenceDebounce)
+			} else {
+				resetStatisticsPersistenceTimer(timer, statisticsPersistenceDebounce)
+			}
+			timerCh = timer.C
+		case <-timerCh:
+			if err := persistStatisticsSnapshotToFile(stats, filePath); err != nil {
+				log.WithError(err).Warn("usage: failed to persist statistics snapshot")
+			}
+			timerCh = nil
+		case <-stop:
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+			if err := persistStatisticsSnapshotToFile(stats, filePath); err != nil {
+				log.WithError(err).Warn("usage: failed to flush statistics snapshot")
+			}
+			return
+		}
+	}
+}
+
+func resetStatisticsPersistenceTimer(timer *time.Timer, d time.Duration) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
+}
+
+func resolveStatisticsPersistencePath(configPath string) (string, error) {
+	base := strings.TrimSpace(configPath)
+	if base == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("usage: resolve working directory: %w", err)
+		}
+		return filepath.Join(wd, statisticsPersistenceFileName), nil
+	}
+
+	if !filepath.IsAbs(base) {
+		if abs, err := filepath.Abs(base); err == nil {
+			base = abs
+		}
+	}
+
+	dir := base
+	if ext := strings.TrimSpace(filepath.Ext(base)); ext != "" {
+		dir = filepath.Dir(base)
+	}
+	return filepath.Join(dir, statisticsPersistenceFileName), nil
+}
+
+func loadStatisticsSnapshotFromFile(stats *RequestStatistics, filePath string) error {
+	if stats == nil || strings.TrimSpace(filePath) == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("usage: read persisted statistics: %w", err)
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return nil
+	}
+
+	var payload statisticsPersistencePayload
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal == nil {
+		if payload.Version != 0 || !payload.ExportedAt.IsZero() || payload.Usage.TotalRequests != 0 || len(payload.Usage.APIs) > 0 {
+			stats.MergeSnapshot(payload.Usage)
+			return nil
+		}
+	}
+
+	var snapshot StatisticsSnapshot
+	if errUnmarshal := json.Unmarshal(data, &snapshot); errUnmarshal != nil {
+		return fmt.Errorf("usage: unmarshal persisted statistics: %w", errUnmarshal)
+	}
+	stats.MergeSnapshot(snapshot)
+	return nil
+}
+
+func persistStatisticsSnapshotToFile(stats *RequestStatistics, filePath string) error {
+	if stats == nil || strings.TrimSpace(filePath) == "" {
+		return nil
+	}
+
+	payload := statisticsPersistencePayload{
+		Version:    1,
+		ExportedAt: time.Now().UTC(),
+		Usage:      stats.Snapshot(),
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("usage: marshal persisted statistics: %w", err)
+	}
+	if errMkdir := os.MkdirAll(filepath.Dir(filePath), 0o700); errMkdir != nil {
+		return fmt.Errorf("usage: create statistics directory: %w", errMkdir)
+	}
+	if errWrite := os.WriteFile(filePath, data, 0o600); errWrite != nil {
+		return fmt.Errorf("usage: write persisted statistics: %w", errWrite)
+	}
+	return nil
 }
 
 func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {

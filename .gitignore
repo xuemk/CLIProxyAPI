@@ -30,6 +30,7 @@ docs/*
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+CPA个性化二开方案.md
 
 # Tooling metadata
 .vscode/*

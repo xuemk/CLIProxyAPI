@@ -25,13 +25,16 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
-	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
-	managementAssetName          = "management.html"
-	httpUserAgent                = "CLIProxyAPI-management-updater"
-	managementSyncMinInterval    = 30 * time.Second
-	updateCheckInterval          = 3 * time.Hour
-	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	legacyManagementPanelRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	defaultManagementReleaseURL     = "https://api.github.com/repos/xuemk/CLIProxyAPI/releases/latest"
+	defaultManagementRawURL         = "https://raw.githubusercontent.com/xuemk/CLIProxyAPI/main/management-panel/management.html"
+	defaultManagementFallbackURL    = defaultManagementRawURL
+	managementAssetName             = "management.html"
+	managementRawAssetPath          = "management-panel/management.html"
+	httpUserAgent                   = "CLIProxyAPI-management-updater"
+	managementSyncMinInterval       = 30 * time.Second
+	updateCheckInterval             = 3 * time.Hour
+	maxAssetDownloadSize            = 50 << 20 // 10 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -222,6 +225,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		releaseURL := resolveReleaseURL(panelRepository)
+		rawURL := resolveRawAssetURL(panelRepository)
 		client := newHTTPClient(proxyURL)
 
 		localHash, err := fileSHA256(localPath)
@@ -234,14 +238,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
 		if err != nil {
-			if localFileMissing {
-				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
-					return nil, nil
-				}
+			log.WithError(err).Warn("failed to fetch latest management release information, trying raw management page")
+			if ensureRawManagementHTML(ctx, client, localPath, rawURL, localHash) {
 				return nil, nil
 			}
-			log.WithError(err).Warn("failed to fetch latest management release information")
+			if localFileMissing && ensureFallbackManagementHTML(ctx, client, localPath, localHash) {
+				return nil, nil
+			}
 			return nil, nil
 		}
 
@@ -252,14 +255,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
 		if err != nil {
-			if localFileMissing {
-				log.WithError(err).Warn("failed to download management asset, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
-					return nil, nil
-				}
+			log.WithError(err).Warn("failed to download management asset, trying raw management page")
+			if ensureRawManagementHTML(ctx, client, localPath, rawURL, localHash) {
 				return nil, nil
 			}
-			log.WithError(err).Warn("failed to download management asset")
+			if localFileMissing && ensureFallbackManagementHTML(ctx, client, localPath, localHash) {
+				return nil, nil
+			}
 			return nil, nil
 		}
 
@@ -281,27 +283,100 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	return err == nil
 }
 
-func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
-	data, downloadedHash, err := downloadAsset(ctx, client, defaultManagementFallbackURL)
+func ensureRawManagementHTML(ctx context.Context, client *http.Client, localPath string, rawURL string, localHash string) bool {
+	data, downloadedHash, err := downloadAsset(ctx, client, rawURL)
 	if err != nil {
-		log.WithError(err).Warn("failed to download fallback management control panel page")
+		log.WithError(err).Warn("failed to download raw management control panel page")
 		return false
 	}
+	if localHash != "" && strings.EqualFold(localHash, downloadedHash) {
+		log.Debug("raw management asset is already up to date")
+		return true
+	}
 
-	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
-		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
+	log.Warnf("management asset downloaded from raw URL without release digest verification (hash=%s)", downloadedHash)
 
 	if err = atomicWriteFile(localPath, data); err != nil {
-		log.WithError(err).Warn("failed to persist fallback management control panel page")
+		log.WithError(err).Warn("failed to persist raw management control panel page")
 		return false
 	}
 
-	log.Infof("management asset updated from fallback page successfully (hash=%s)", downloadedHash)
+	log.Infof("management asset updated from raw page successfully (hash=%s)", downloadedHash)
 	return true
 }
 
-func resolveReleaseURL(repo string) string {
+func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string, localHash string) bool {
+	return ensureRawManagementHTML(ctx, client, localPath, defaultManagementFallbackURL, localHash)
+}
+
+func normalizePanelRepository(repo string) string {
 	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return ""
+	}
+	normalized := strings.TrimSuffix(strings.ToLower(repo), "/")
+	normalized = strings.TrimSuffix(normalized, ".git")
+	legacy := strings.TrimSuffix(strings.ToLower(legacyManagementPanelRepository), "/")
+	if normalized == legacy {
+		return ""
+	}
+	if normalized == "https://api.github.com/repos/router-for-me/cli-proxy-api-management-center/releases/latest" {
+		return ""
+	}
+	return repo
+}
+
+func resolveRawAssetURL(repo string) string {
+	repo = normalizePanelRepository(repo)
+	if repo == "" {
+		return defaultManagementRawURL
+	}
+
+	parsed, err := url.Parse(repo)
+	if err != nil {
+		return defaultManagementRawURL
+	}
+	host := strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	if host == "raw.githubusercontent.com" {
+		return parsed.String()
+	}
+
+	if host == "api.github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 3 && parts[0] == "repos" && parts[1] != "" && parts[2] != "" {
+			return formatRawAssetURL(parts[1], strings.TrimSuffix(parts[2], ".git"), "main", managementRawAssetPath)
+		}
+	}
+
+	if host == "github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			repoName := strings.TrimSuffix(parts[1], ".git")
+			if len(parts) >= 5 && (parts[2] == "blob" || parts[2] == "raw") && parts[3] != "" {
+				return formatRawAssetURL(parts[0], repoName, parts[3], strings.Join(parts[4:], "/"))
+			}
+			return formatRawAssetURL(parts[0], repoName, "main", managementRawAssetPath)
+		}
+	}
+
+	return defaultManagementRawURL
+}
+
+func formatRawAssetURL(owner, repoName, refName, assetPath string) string {
+	owner = strings.Trim(owner, "/")
+	repoName = strings.Trim(strings.TrimSuffix(repoName, ".git"), "/")
+	refName = strings.Trim(refName, "/")
+	assetPath = strings.Trim(assetPath, "/")
+	if owner == "" || repoName == "" || refName == "" || assetPath == "" {
+		return defaultManagementRawURL
+	}
+	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repoName, refName, assetPath)
+}
+
+func resolveReleaseURL(repo string) string {
+	repo = normalizePanelRepository(repo)
 	if repo == "" {
 		return defaultManagementReleaseURL
 	}

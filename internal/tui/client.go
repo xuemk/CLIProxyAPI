@@ -170,6 +170,34 @@ func (c *Client) DeleteAuthFile(name string) error {
 	return nil
 }
 
+// DeleteAuthFiles deletes multiple auth files by name in one request.
+func (c *Client) DeleteAuthFiles(names []string) error {
+	query := url.Values{}
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		query.Add("name", trimmed)
+	}
+	encoded := query.Encode()
+	if encoded == "" {
+		return fmt.Errorf("no auth files selected")
+	}
+	path := "/v0/management/auth-files?" + encoded
+	data, code, err := c.doRequest("DELETE", path, nil)
+	if err != nil {
+		return err
+	}
+	if code == http.StatusMultiStatus {
+		return fmt.Errorf("partial delete: %s", strings.TrimSpace(string(data)))
+	}
+	if code >= 400 {
+		return fmt.Errorf("delete failed (HTTP %d)", code)
+	}
+	return nil
+}
+
 // ToggleAuthFile enables or disables an auth file.
 func (c *Client) ToggleAuthFile(name string, disabled bool) error {
 	body, _ := json.Marshal(map[string]any{"name": name, "disabled": disabled})
